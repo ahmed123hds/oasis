@@ -133,10 +133,12 @@ def build_loaders(args):
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, drop_last=True,
+        pin_memory=False,  # pin_memory=True causes errors on XLA
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size * 2, shuffle=False,
         num_workers=args.num_workers, drop_last=False,
+        pin_memory=False,
     )
     return train_loader, val_loader
 
@@ -216,7 +218,9 @@ def parse_args():
     p.add_argument("--log-every",     type=int,   default=50)
     p.add_argument("--data-dir",      type=str,   default="./data")
     p.add_argument("--seed",          type=int,   default=42)
-    p.add_argument("--num-workers",   type=int,   default=4)
+    # IMPORTANT: Keep num-workers=0 on TPU. DataLoader multiprocessing workers
+    # deadlock against the XLA runtime thread after step 1.
+    p.add_argument("--num-workers",   type=int,   default=0)
     p.add_argument("--dataset",       type=str,   default="cifar10", choices=["cifar10", "cifar100"])
     # Compression
     p.add_argument("--rank-table",    type=str,   default=None, help="JSON rank table from calibrate_ranks.py")
