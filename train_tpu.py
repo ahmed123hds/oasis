@@ -97,16 +97,15 @@ def train_one_epoch(epoch, model, loader, criterion, optimizer, scheduler, compr
     train_compute_time = 0.0   # forward + backward + compress + optimizer (XLA sync'd)
     log_overhead_time  = 0.0   # printing / metric formatting only
 
-    # For single-process TPU training, ParallelLoader is safer than MpDeviceLoader
-    device_loader = pl.ParallelLoader(loader, [device]).per_device_loader(device)
-
-    for step, (images, labels) in enumerate(device_loader, start=1):
+    # For single-device TPU, standard .to(device) avoids multithreading queue hangs
+    for step, (images, labels) in enumerate(loader, start=1):
+        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         # ── Pure compute: forward + backward + compress + optimizer ───────────
         _t_compute = time.perf_counter()
 
         logits = model(images)
         loss   = criterion(logits, labels)
-        acc    = accuracy(logits, labels)
+        acc_tensor = (logits.argmax(1) == labels).float().mean()
 
         optimizer.zero_grad()
         loss.backward()
@@ -126,11 +125,17 @@ def train_one_epoch(epoch, model, loader, criterion, optimizer, scheduler, compr
         # ─────────────────────────────────────────────────────────────────────
 
         global_step[0] += 1
+        
+        # VERY IMPORTANT FOR XLA: Do not call .item() until AFTER xm.optimizer_step!
+        # Calling .item() earlier forces two graph compilations per step.
         running_loss += loss.item()
-        running_acc  += acc
+        running_acc  += acc_tensor.item()
         n_batches    += 1
 
         # ── Logging (time tracked separately) ─────────────────────────────────
+        if step == 1 and xm.is_master_ordinal():
+            print(f"    [TPU info] Step 1 compiled and finished! Graph is cached. Training will now be fast.")
+
         if step % args.log_every == 0 or step == len(loader):
             avg_loss = running_loss / n_batches
             avg_acc  = running_acc  / n_batches
@@ -149,12 +154,18 @@ def train_one_epoch(epoch, model, loader, criterion, optimizer, scheduler, compr
 def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss = total_acc = n = 0
-    device_loader = pl.ParallelLoader(loader, [device]).per_device_loader(device)
     
-    for images, labels in device_loader:
+    for images, labels in loader:
+        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         logits = model(images)
-        total_loss += criterion(logits, labels).item()
-        total_acc  += accuracy(logits, labels)
+        loss = criterion(logits, labels)
+        acc_tensor = (logits.argmax(1) == labels).float().mean()
+        
+        # Force graph execution
+        xm.mark_step()
+        
+        total_loss += loss.item()
+        total_acc  += acc_tensor.item()
         n += 1
         
     return total_loss / n, total_acc / n
