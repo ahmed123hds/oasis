@@ -68,7 +68,11 @@ def main():
         optimizer.step()
 
         for name, stats in compressor.last_stats.items():
-            rank_history[name].append(stats["rank_selected"])
+            if "rank_selected" in stats:
+                try:
+                    rank_history[name].append(int(stats["rank_selected"]))
+                except (ValueError, TypeError):
+                    pass
             
         if step % 50 == 0:
             print(f"  Calibration step {step}/{args.steps}...")
