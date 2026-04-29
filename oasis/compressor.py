@@ -249,10 +249,16 @@ class OASISCompressor:
     # ── OASIS-Track ───────────────────────────────────────────────────────────
 
     def _compress_track(self, H_2d, G_2d, pid, m, n, name):
+        layer_fixed_rank = self.fixed_rank
+        if self.rank_table is not None and name in self.rank_table:
+            layer_fixed_rank = self.rank_table[name]
+
         r_max = min(self.r_max, min(m, n))
+        if layer_fixed_rank is not None:
+            r_max = min(layer_fixed_rank, min(m, n))
 
         # Initialize V with orthonormal random matrix
-        if pid not in self._track_state:
+        if pid not in self._track_state or self._track_state[pid].shape[1] != r_max:
             V0 = torch.linalg.qr(
                 torch.randn(n, r_max, device=H_2d.device, dtype=H_2d.dtype)
             ).Q
@@ -261,17 +267,24 @@ class OASISCompressor:
         V_old = self._track_state[pid]
         self._refresh_counts[pid] = self._refresh_counts.get(pid, 0) + 1
 
-        layer_fixed_rank = self.fixed_rank
-        if self.rank_table is not None and name in self.rank_table:
-            layer_fixed_rank = self.rank_table[name]
+        if layer_fixed_rank is not None:
+            # Completely bypass SVD for XLA static-graph execution!
+            # Level 1: one warm power step on H
+            U = torch.linalg.qr(H_2d @ V_old,    mode="reduced").Q   # [m, r_max]
+            V_new = torch.linalg.qr(H_2d.T @ U,  mode="reduced").Q   # [n, r_max]
+            
+            # G_hat = U @ (U.T @ G_2d @ V) @ V.T
+            G_hat = U @ (U.T @ G_2d @ V_new) @ V_new.T
+            r_val = r_max
+        else:
+            compressed, r_val, V_new = _track_compress(
+                H_2d, G_2d, V_old, r_max, self.energy_tau, self.r_min,
+                fixed_rank=None
+            )
+            G_hat = compressed
 
-        compressed, r, V_new = _track_compress(
-            H_2d, G_2d, V_old, r_max, self.energy_tau, self.r_min,
-            fixed_rank=layer_fixed_rank   # None → adaptive; int → fixed-rank ablation
-        )
-        self._track_state[pid] = V_new
-
-        return compressed, r, True, 1.0   # always "refreshes" (continuous tracking)
+        self._track_state[pid] = V_new.detach()
+        return G_hat, r_val, True, 1.0   # always "refreshes" (continuous tracking)
 
     # ── OASIS-Exact (original) ────────────────────────────────────────────────
 

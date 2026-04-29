@@ -206,7 +206,9 @@ def main():
     )
 
     logger = OASISLogger(args.epochs, len(train_loader), args.log_every)
-    if args.mode == "track":
+    if args.mode == "calibrated-track":
+        mode_str = "OASIS-Calibrated Track"
+    elif args.mode == "track":
         mode_str = f"OASIS-Track  r_max={args.r_max}  energy_tau={args.energy_tau}"
     elif args.adaptive_refresh:
         mode_str = f"OASIS-Fast  tau_drift={args.tau_drift}"
