@@ -81,6 +81,9 @@ def main():
     final_ranks = {}
     print("\nCalibration complete. Assigned ranks:")
     for name, ranks in rank_history.items():
+        if not ranks:
+            print(f"  {name}: skipped (no valid rank data)")
+            continue
         median_rank = int(statistics.median(ranks))
         final_ranks[name] = median_rank
         print(f"  {name}: {median_rank}")
