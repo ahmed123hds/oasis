@@ -51,6 +51,8 @@ def parse_args():
                    choices=["optimizer_aware", "energy", "fixed"])
     p.add_argument("--fixed-rank",        type=int,   default=None)
     p.add_argument("--rank-table",        type=str,   default=None,     help="JSON file mapping layer names to fixed ranks")
+    p.add_argument("--bases-file",        type=str,   default=None,     help="PyTorch file containing precomputed projection bases for each layer")
+    p.add_argument("--freeze-bases",      action="store_true",          help="Bypass QR entirely and use completely static frozen bases")
     p.add_argument("--dataset",           type=str,   default="cifar10", choices=["cifar10", "cifar100"])
     p.add_argument("--skip-classifier",   action="store_true")
     return p.parse_args()
@@ -185,6 +187,11 @@ def main():
         with open(args.rank_table, 'r') as f:
             rank_table = json.load(f)
 
+    # Load precomputed bases if provided
+    precomputed_bases = None
+    if args.bases_file:
+        precomputed_bases = torch.load(args.bases_file, map_location=device)
+
     train_loader, val_loader = build_loaders(args)
     num_classes = 100 if args.dataset == "cifar100" else 10
     model = ResNet18CIFAR(num_classes=num_classes).to(device)
@@ -202,7 +209,8 @@ def main():
         min_numel=args.min_numel,
         update_freq=args.update_freq, adaptive_refresh=args.adaptive_refresh,
         criterion=args.criterion, fixed_rank=args.fixed_rank,
-        rank_table=rank_table, skip_classifier=args.skip_classifier,
+        rank_table=rank_table, precomputed_bases=precomputed_bases, 
+        freeze_bases=args.freeze_bases, skip_classifier=args.skip_classifier,
     )
 
     logger = OASISLogger(args.epochs, len(train_loader), args.log_every)

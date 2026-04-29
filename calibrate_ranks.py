@@ -27,6 +27,7 @@ def main():
     p.add_argument("--r-max", type=int, default=72)
     p.add_argument("--steps", type=int, default=200, help="Number of calibration batches")
     p.add_argument("--out", type=str, default="ranks_cifar100.json")
+    p.add_argument("--out-bases", type=str, default="bases_cifar100.pt", help="File to save precomputed projection bases")
     p.add_argument("--data-dir", type=str, default="./data")
     p.add_argument("--num-workers", type=int, default=4)
     args = p.parse_args()
@@ -91,8 +92,25 @@ def main():
     with open(args.out, 'w') as f:
         json.dump(final_ranks, f, indent=2)
     
+    # Save the projection bases (V matrices) for each layer
+    # We only need the latest V matrix from the track state
+    bases = {}
+    for pid, V in compressor._track_state.items():
+        # Find the name corresponding to this pid
+        for name, param in model.named_parameters():
+            if id(param) == pid:
+                # Slice V to the calibrated median rank
+                if name in final_ranks:
+                    r = final_ranks[name]
+                    bases[name] = V[:, :r].cpu()
+                break
+    
+    torch.save(bases, args.out_bases)
+    
     print(f"\nSaved rank table to {args.out}")
-    print(f"You can now run TPU training with: --mode calibrated-track --rank-table {args.out}")
+    print(f"Saved projection bases to {args.out_bases}")
+    print(f"You can now run TPU training with:")
+    print(f"  --mode calibrated-track --rank-table {args.out} --bases-file {args.out_bases}")
 
 if __name__ == "__main__":
     main()

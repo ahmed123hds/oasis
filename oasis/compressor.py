@@ -124,6 +124,8 @@ class OASISCompressor:
         criterion: str = "optimizer_aware",
         fixed_rank: Optional[int] = None,
         rank_table: Optional[Dict[str, int]] = None,
+        precomputed_bases: Optional[Dict[str, torch.Tensor]] = None,
+        freeze_bases: bool = False,
         skip_classifier: bool = True,  # Skip compressing the final layer
     ):
         self.mode             = mode
@@ -142,6 +144,8 @@ class OASISCompressor:
         self.criterion        = criterion
         self.fixed_rank       = fixed_rank
         self.rank_table       = rank_table
+        self.precomputed_bases = precomputed_bases
+        self.freeze_bases      = freeze_bases
         self.skip_classifier  = skip_classifier
 
         # Per-layer state
@@ -257,25 +261,38 @@ class OASISCompressor:
         if layer_fixed_rank is not None:
             r_max = min(layer_fixed_rank, min(m, n))
 
-        # Initialize V with orthonormal random matrix
+        # Initialize V with precomputed bases or orthonormal random matrix
         if pid not in self._track_state or self._track_state[pid].shape[1] != r_max:
-            V0 = torch.linalg.qr(
-                torch.randn(n, r_max, device=H_2d.device, dtype=H_2d.dtype)
-            ).Q
+            if self.precomputed_bases is not None and name in self.precomputed_bases:
+                V0 = self.precomputed_bases[name].to(H_2d.device, dtype=H_2d.dtype)
+                # Ensure shape matches r_max exactly
+                if V0.shape[1] != r_max:
+                    V0 = torch.linalg.qr(V0[:, :r_max], mode="reduced").Q
+            else:
+                V0 = torch.linalg.qr(
+                    torch.randn(n, r_max, device=H_2d.device, dtype=H_2d.dtype)
+                ).Q
             self._track_state[pid] = V0
 
         V_old = self._track_state[pid]
         self._refresh_counts[pid] = self._refresh_counts.get(pid, 0) + 1
 
         if layer_fixed_rank is not None:
-            # Completely bypass SVD for XLA static-graph execution!
-            # Level 1: one warm power step on H
-            U = torch.linalg.qr(H_2d @ V_old,    mode="reduced").Q   # [m, r_max]
-            V_new = torch.linalg.qr(H_2d.T @ U,  mode="reduced").Q   # [n, r_max]
-            
-            # G_hat = U @ (U.T @ G_2d @ V) @ V.T
-            G_hat = U @ (U.T @ G_2d @ V_new) @ V_new.T
-            r_val = r_max
+            if self.freeze_bases:
+                # Extreme XLA static mode: completely freeze the precomputed subspace basis
+                # Bypasses both SVD and QR entirely!
+                G_hat = (G_2d @ V_old) @ V_old.T
+                r_val = r_max
+                V_new = V_old
+            else:
+                # Completely bypass SVD for XLA static-graph execution!
+                # Level 1: one warm power step on H
+                U = torch.linalg.qr(H_2d @ V_old,    mode="reduced").Q   # [m, r_max]
+                V_new = torch.linalg.qr(H_2d.T @ U,  mode="reduced").Q   # [n, r_max]
+                
+                # G_hat = U @ (U.T @ G_2d @ V) @ V.T
+                G_hat = U @ (U.T @ G_2d @ V_new) @ V_new.T
+                r_val = r_max
         else:
             compressed, r_val, V_new = _track_compress(
                 H_2d, G_2d, V_old, r_max, self.energy_tau, self.r_min,
