@@ -147,19 +147,20 @@ def build_loaders(args):
 
 def train_one_epoch(epoch, model, loader, criterion, optimizer, scheduler, compressor, logger, device, args):
     model.train()
-    running_loss = running_acc = n_batches = 0
+    running_loss = 0.0
+    running_acc  = 0.0
+    n_batches    = 0
     train_compute_time = 0.0
 
     for step, (images, labels) in enumerate(loader, start=1):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        images = images.to(device)
+        labels = labels.to(device)
 
         _t = time.perf_counter()
 
         # ── Forward ──────────────────────────────────────────────────────────
         logits = model(images)
         loss   = criterion(logits, labels)
-        acc_t  = (logits.argmax(1) == labels).float().mean()
 
         # ── Backward ─────────────────────────────────────────────────────────
         optimizer.zero_grad()
@@ -169,25 +170,37 @@ def train_one_epoch(epoch, model, loader, criterion, optimizer, scheduler, compr
         if compressor is not None:
             compressor.compress_all(model)
 
-        # ── Optimizer step — triggers XLA graph execution ─────────────────────
-        xm.optimizer_step(optimizer)
+        # ── Optimizer step ────────────────────────────────────────────────────
+        # CRITICAL: Do NOT use xm.optimizer_step() on a TPU Pod.
+        # It calls xm.reduce_gradients() internally which does an all-reduce
+        # across all workers. If workers desync by even one step, deadlock.
+        # Instead: plain optimizer.step() + xm.mark_step() for local execution.
+        optimizer.step()
+        xm.mark_step()
 
         train_compute_time += time.perf_counter() - _t
 
-        # ── Metrics (after optimizer_step so graph is already flushed) ────────
-        running_loss += loss.item()
-        running_acc  += acc_t.item()
-        n_batches    += 1
+        n_batches += 1
 
-        if step == 1 and xm.is_master_ordinal():
-            print("    [TPU] Step 1 done — graph cached, training is now fast!")
-
-        if (step % args.log_every == 0 or step == len(loader)) and xm.is_master_ordinal():
-            logger.step_log(epoch, step, running_loss / n_batches,
-                            running_acc / n_batches, optimizer.param_groups[0]["lr"])
+        # ── Logging (only sync to host at log intervals to minimize stalls) ──
+        if step == 1:
+            # Force a host sync on step 1 to confirm compilation finished
+            loss_val = loss.item()
+            print(f"    [TPU] Step 1 done (loss={loss_val:.4f}) — graph cached, training is now fast!")
+            running_loss += loss_val
+            running_acc  += (logits.argmax(1) == labels).float().mean().item()
+        elif step % args.log_every == 0 or step == len(loader):
+            running_loss += loss.item()
+            running_acc  += (logits.argmax(1) == labels).float().mean().item()
+            if xm.is_master_ordinal():
+                logger.step_log(epoch, step, running_loss / n_batches,
+                                running_acc / n_batches, optimizer.param_groups[0]["lr"])
+        # Steps between log intervals: no .item() calls, pure XLA execution
 
     scheduler.step()
-    return running_loss / n_batches, running_acc / n_batches, train_compute_time
+    avg_loss = running_loss / max(n_batches, 1)
+    avg_acc  = running_acc  / max(n_batches, 1)
+    return avg_loss, avg_acc, train_compute_time
 
 
 @torch.no_grad()
@@ -195,11 +208,12 @@ def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss = total_acc = n = 0
     for images, labels in loader:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        images = images.to(device)
+        labels = labels.to(device)
         logits = model(images)
         loss   = criterion(logits, labels)
         acc_t  = (logits.argmax(1) == labels).float().mean()
+        # Local-only graph flush, no cross-worker sync
         xm.mark_step()
         total_loss += loss.item()
         total_acc  += acc_t.item()
