@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
+"""
+OASIS TPU Trainer — XLA-native, static-graph implementation.
+
+Key design principle: The entire forward → backward → compress → step sequence
+must be ONE contiguous XLA graph. This means:
+  1. No Python loops over parameters inside the hot path.
+  2. No .item() calls before xm.optimizer_step().
+  3. Compression is done via pre-registered static projection matrices (V).
+  4. All compression math is pure torch tensor ops (matmul only in freeze mode).
+"""
 import argparse
+import json
 import os
 import sys
 import time
 from pathlib import Path
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -11,57 +23,97 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-# PyTorch XLA imports
-import torch_xla
 import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from oasis.compressor import OASISCompressor
+from oasis.model import ResNet18CIFAR
 from oasis.logger import OASISLogger
-from oasis.model import ResNet18CIFAR, count_parameters
 
-def parse_args():
-    p = argparse.ArgumentParser(description="OASIS CIFAR Smoke Test (TPU/XLA Version)")
-    p.add_argument("--epochs",          type=int,   default=20)
-    p.add_argument("--batch-size",      type=int,   default=128)
-    p.add_argument("--lr",              type=float, default=1e-3)
-    p.add_argument("--weight-decay",    type=float, default=5e-4)
-    p.add_argument("--tau",             type=float, default=0.98)
-    p.add_argument("--r-max-fraction",  type=float, default=0.5)
-    p.add_argument("--n-power-iter",    type=int,   default=2)
-    p.add_argument("--no-error-feedback", action="store_true")
-    p.add_argument("--compress-warmup", type=int,   default=1)
-    p.add_argument("--log-every",       type=int,   default=50)
-    p.add_argument("--data-dir",        type=str,   default="./data")
-    p.add_argument("--seed",            type=int,   default=42)
-    p.add_argument("--num-workers",     type=int,   default=4)
-    
-    # Ablation / mode flags
-    p.add_argument("--mode",              type=str,   default="exact",  choices=["exact", "track", "calibrated-track"],
-                   help="exact=randomized SVD, track=OASIS-Track (online), calibrated-track=frozen layer-wise ranks")
-    p.add_argument("--r-max",             type=int,   default=72,       help="Max rank for OASIS-Track")
-    p.add_argument("--energy-tau",        type=float, default=0.97,     help="Core energy threshold for OASIS-Track rank selection")
-    p.add_argument("--min-numel",         type=int,   default=1024,     help="Skip compression for tensors smaller than this")
-    p.add_argument("--update-freq",       type=int,   default=1,        help="Fixed-K refresh interval (exact mode only)")
-    p.add_argument("--adaptive-refresh",  action="store_true",           help="Drift-triggered refresh (exact mode only)")
-    p.add_argument("--tau-drift",         type=float, default=0.95,     help="Drift trigger threshold")
-    p.add_argument("--criterion",         type=str,   default="optimizer_aware",
-                   choices=["optimizer_aware", "energy", "fixed"])
-    p.add_argument("--fixed-rank",        type=int,   default=None)
-    p.add_argument("--rank-table",        type=str,   default=None,     help="JSON file mapping layer names to fixed ranks")
-    p.add_argument("--bases-file",        type=str,   default=None,     help="PyTorch file containing precomputed projection bases for each layer")
-    p.add_argument("--freeze-bases",      action="store_true",          help="Bypass QR entirely and use completely static frozen bases")
-    p.add_argument("--dataset",           type=str,   default="cifar10", choices=["cifar10", "cifar100"])
-    p.add_argument("--skip-classifier",   action="store_true")
-    return p.parse_args()
 
+# ── XLA-Native Gradient Compressor ───────────────────────────────────────────
+
+class FrozenBasisCompressor:
+    """
+    Gradient compressor for TPU/XLA that uses only static-shape matrix
+    multiplications. All dynamic logic (SVD, QR, rank selection) has been
+    moved OUTSIDE the training graph.
+
+    During training, compression is exactly:
+        G_hat = (G @ V) @ V.T
+    where V is a fixed, preloaded orthonormal basis matrix for each layer.
+
+    This produces a static XLA graph: two matmuls, zero control flow.
+    """
+
+    def __init__(
+        self,
+        rank_table: Dict[str, int],
+        bases: Dict[str, torch.Tensor],
+        min_numel: int = 1024,
+        skip_classifier: bool = True,
+    ):
+        self.rank_table = rank_table
+        self.bases = bases          # name → V  [n, r]  on XLA device
+        self.min_numel = min_numel
+        self.skip_classifier = skip_classifier
+        self.last_stats: Dict[str, dict] = {}
+
+    @torch.no_grad()
+    def compress_all(self, model: nn.Module):
+        """
+        Compress every compressible gradient in-place.
+        Called AFTER loss.backward(), BEFORE xm.optimizer_step().
+
+        All operations are pure XLA tensor ops — no Python control flow
+        that depends on tensor values, no .item() calls.
+        """
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                continue
+            G = param.grad
+
+            # Skip small / 1D / classifier tensors
+            is_classifier = self.skip_classifier and ("fc." in name or "classifier" in name)
+            if G.dim() < 2 or G.numel() < self.min_numel or is_classifier:
+                continue
+
+            if name not in self.bases:
+                continue
+
+            V = self.bases[name]        # [n, r]  static, on XLA device
+            G_2d = G.reshape(G.shape[0], -1)   # [m, n]
+
+            # G_hat = (G @ V) @ V.T  — two static-shape matmuls, nothing else
+            G_hat = (G_2d @ V) @ V.t()
+            param.grad = G_hat.reshape(G.shape)
+
+
+def build_frozen_compressor(rank_table_path: str, bases_path: str, device) -> FrozenBasisCompressor:
+    """Load rank table + bases from disk and build the compressor."""
+    with open(rank_table_path) as f:
+        rank_table = json.load(f)
+
+    # Always load to CPU first — XLA cannot restore tagged xla:0 storages
+    raw_bases = torch.load(bases_path, map_location="cpu", weights_only=True)
+
+    # Move to XLA device one tensor at a time
+    bases_on_device = {}
+    for name, V in raw_bases.items():
+        r = rank_table.get(name)
+        if r is not None:
+            # Trim to calibrated rank if the saved basis is wider
+            bases_on_device[name] = V[:, :r].to(device)
+
+    return FrozenBasisCompressor(rank_table, bases_on_device)
+
+
+# ── Data Loading ──────────────────────────────────────────────────────────────
 
 def build_loaders(args):
     is_cifar100 = args.dataset == "cifar100"
     mean = (0.5071, 0.4867, 0.4408) if is_cifar100 else (0.4914, 0.4822, 0.4465)
-    std = (0.2675, 0.2565, 0.2761) if is_cifar100 else (0.2470, 0.2435, 0.2616)
+    std  = (0.2675, 0.2565, 0.2761) if is_cifar100 else (0.2470, 0.2435, 0.2616)
 
     train_tf = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
@@ -75,7 +127,6 @@ def build_loaders(args):
     ])
 
     ds_class = datasets.CIFAR100 if is_cifar100 else datasets.CIFAR10
-    # Add xm.is_master_ordinal() to only download on the main process if running distributed
     train_ds = ds_class(args.data_dir, train=True,  download=xm.is_master_ordinal(), transform=train_tf)
     val_ds   = ds_class(args.data_dir, train=False, download=xm.is_master_ordinal(), transform=val_tf)
 
@@ -90,64 +141,48 @@ def build_loaders(args):
     return train_loader, val_loader
 
 
-def accuracy(logits, labels):
-    return (logits.argmax(1) == labels).float().mean().item()
+# ── Training & Eval Loops ─────────────────────────────────────────────────────
 
-def train_one_epoch(epoch, model, loader, criterion, optimizer, scheduler, compressor, logger, device, args, global_step):
+def train_one_epoch(epoch, model, loader, criterion, optimizer, scheduler, compressor, logger, device, args):
     model.train()
     running_loss = running_acc = n_batches = 0
+    train_compute_time = 0.0
 
-    train_compute_time = 0.0   # forward + backward + compress + optimizer (XLA sync'd)
-    log_overhead_time  = 0.0   # printing / metric formatting only
-
-    # For single-device TPU, standard .to(device) avoids multithreading queue hangs
     for step, (images, labels) in enumerate(loader, start=1):
-        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-        # ── Pure compute: forward + backward + compress + optimizer ───────────
-        _t_compute = time.perf_counter()
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
+        _t = time.perf_counter()
+
+        # ── Forward ──────────────────────────────────────────────────────────
         logits = model(images)
         loss   = criterion(logits, labels)
-        acc_tensor = (logits.argmax(1) == labels).float().mean()
+        acc_t  = (logits.argmax(1) == labels).float().mean()
 
+        # ── Backward ─────────────────────────────────────────────────────────
         optimizer.zero_grad()
         loss.backward()
 
-        compression_stats = None
-        if global_step[0] >= args.compress_warmup:
-            compute_metrics = (step % args.log_every == 0) or (step == len(loader))
-            compression_stats = compressor.compress_model(
-                model, optimizer, step=global_step[0], compute_metrics=compute_metrics
-            )
+        # ── Compress (pure XLA matmuls, no Python control flow on values) ────
+        if compressor is not None:
+            compressor.compress_all(model)
 
-        # XLA requires xm.optimizer_step instead of optimizer.step()
-        # This implicitly calls xm.mark_step() and executes the XLA graph.
+        # ── Optimizer step — triggers XLA graph execution ─────────────────────
         xm.optimizer_step(optimizer)
 
-        train_compute_time += time.perf_counter() - _t_compute
-        # ─────────────────────────────────────────────────────────────────────
+        train_compute_time += time.perf_counter() - _t
 
-        global_step[0] += 1
-        
-        # VERY IMPORTANT FOR XLA: Do not call .item() until AFTER xm.optimizer_step!
-        # Calling .item() earlier forces two graph compilations per step.
+        # ── Metrics (after optimizer_step so graph is already flushed) ────────
         running_loss += loss.item()
-        running_acc  += acc_tensor.item()
+        running_acc  += acc_t.item()
         n_batches    += 1
 
-        # ── Logging (time tracked separately) ─────────────────────────────────
         if step == 1 and xm.is_master_ordinal():
-            print(f"    [TPU info] Step 1 compiled and finished! Graph is cached. Training will now be fast.")
+            print("    [TPU] Step 1 done — graph cached, training is now fast!")
 
-        if step % args.log_every == 0 or step == len(loader):
-            avg_loss = running_loss / n_batches
-            avg_acc  = running_acc  / n_batches
-            show_stats = compression_stats if step % args.log_every == 0 else None
-            # Only log on the master node
-            if xm.is_master_ordinal():
-                logger.step_log(epoch, step, avg_loss, avg_acc, optimizer.param_groups[0]["lr"], show_stats)
-                log_overhead_time += logger._print_overhead  # logger tracks its own print time
-        # ─────────────────────────────────────────────────────────────────────
+        if (step % args.log_every == 0 or step == len(loader)) and xm.is_master_ordinal():
+            logger.step_log(epoch, step, running_loss / n_batches,
+                            running_acc / n_batches, optimizer.param_groups[0]["lr"])
 
     scheduler.step()
     return running_loss / n_batches, running_acc / n_batches, train_compute_time
@@ -157,109 +192,99 @@ def train_one_epoch(epoch, model, loader, criterion, optimizer, scheduler, compr
 def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss = total_acc = n = 0
-    
     for images, labels in loader:
-        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         logits = model(images)
-        loss = criterion(logits, labels)
-        acc_tensor = (logits.argmax(1) == labels).float().mean()
-        
-        # Force graph execution
+        loss   = criterion(logits, labels)
+        acc_t  = (logits.argmax(1) == labels).float().mean()
         xm.mark_step()
-        
         total_loss += loss.item()
-        total_acc  += acc_tensor.item()
+        total_acc  += acc_t.item()
         n += 1
-        
     return total_loss / n, total_acc / n
+
+
+# ── Argument Parsing ──────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="OASIS TPU Trainer (XLA-native frozen-basis compression)")
+    p.add_argument("--epochs",        type=int,   default=20)
+    p.add_argument("--batch-size",    type=int,   default=128)
+    p.add_argument("--lr",            type=float, default=1e-3)
+    p.add_argument("--weight-decay",  type=float, default=5e-4)
+    p.add_argument("--log-every",     type=int,   default=50)
+    p.add_argument("--data-dir",      type=str,   default="./data")
+    p.add_argument("--seed",          type=int,   default=42)
+    p.add_argument("--num-workers",   type=int,   default=4)
+    p.add_argument("--dataset",       type=str,   default="cifar10", choices=["cifar10", "cifar100"])
+    # Compression
+    p.add_argument("--rank-table",    type=str,   default=None, help="JSON rank table from calibrate_ranks.py")
+    p.add_argument("--bases-file",    type=str,   default=None, help=".pt bases file from calibrate_ranks.py")
+    p.add_argument("--no-compress",   action="store_true", help="Disable compression (baseline run)")
+    return p.parse_args()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
-    
-    # Get the XLA device
+
     device = xm.xla_device()
 
-    # Load rank table if provided
-    rank_table = None
-    if args.rank_table:
-        import json
-        with open(args.rank_table, 'r') as f:
-            rank_table = json.load(f)
-
-    # Load precomputed bases if provided
-    precomputed_bases = None
-    if args.bases_file:
-        precomputed_bases = torch.load(args.bases_file, map_location="cpu", weights_only=True)
-        # Manually move to XLA device
-        for k in precomputed_bases.keys():
-            precomputed_bases[k] = precomputed_bases[k].to(device)
+    # Build compressor (or None for baseline)
+    compressor = None
+    mode_str   = "Baseline (no compression)"
+    if not args.no_compress:
+        if args.rank_table is None or args.bases_file is None:
+            raise ValueError("--rank-table and --bases-file are required unless --no-compress is set.\n"
+                             "Run: python3 calibrate_ranks.py --dataset cifar100 --out ranks_cifar100.json --out-bases bases_cifar100.pt")
+        compressor = build_frozen_compressor(args.rank_table, args.bases_file, device)
+        n_compressed = len(compressor.bases)
+        mode_str = f"OASIS-Calibrated (frozen bases, {n_compressed} layers)"
 
     train_loader, val_loader = build_loaders(args)
     num_classes = 100 if args.dataset == "cifar100" else 10
-    model = ResNet18CIFAR(num_classes=num_classes).to(device)
-    
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-
-    compressor = OASISCompressor(
-        mode=args.mode,
-        tau=args.tau,             tau_drift=args.tau_drift,
-        r_max=args.r_max,         energy_tau=args.energy_tau,
-        r_max_fraction=args.r_max_fraction, n_power_iter=args.n_power_iter,
-        use_error_feedback=not args.no_error_feedback, skip_1d=True,
-        min_numel=args.min_numel,
-        update_freq=args.update_freq, adaptive_refresh=args.adaptive_refresh,
-        criterion=args.criterion, fixed_rank=args.fixed_rank,
-        rank_table=rank_table, precomputed_bases=precomputed_bases, 
-        freeze_bases=args.freeze_bases, skip_classifier=args.skip_classifier,
-    )
+    model       = ResNet18CIFAR(num_classes=num_classes).to(device)
+    optimizer   = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler   = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    criterion   = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     logger = OASISLogger(args.epochs, len(train_loader), args.log_every)
-    if args.mode == "calibrated-track":
-        mode_str = "OASIS-Calibrated Track"
-    elif args.mode == "track":
-        mode_str = f"OASIS-Track  r_max={args.r_max}  energy_tau={args.energy_tau}"
-    elif args.adaptive_refresh:
-        mode_str = f"OASIS-Fast  tau_drift={args.tau_drift}"
-    else:
-        mode_str = f"OASIS-Exact  K={args.update_freq}"
-
     if xm.is_master_ordinal():
         logger.print_header({
-            "Dataset"           : args.dataset.upper(),
-            "Mode"              : mode_str,
-            "Criterion"         : args.criterion,
-            "Tau (target)"      : args.tau,
-            "Batch size"        : args.batch_size,
-            "Epochs"            : args.epochs,
-            "Seed"              : args.seed,
-            "Device"            : "TPU (XLA)",
+            "Dataset":    args.dataset.upper(),
+            "Mode":       mode_str,
+            "Batch size": args.batch_size,
+            "Epochs":     args.epochs,
+            "Seed":       args.seed,
+            "Device":     "TPU (XLA)",
         })
 
-    history, best_val_acc, best_epoch, global_step = [], 0.0, 0, [0]
+    history, best_val_acc, best_epoch = [], 0.0, 0
+
     for epoch in range(1, args.epochs + 1):
         if xm.is_master_ordinal():
             logger.epoch_start(epoch)
-            
-        train_loss, train_acc, train_compute_time = train_one_epoch(
+
+        train_loss, train_acc, compute_time = train_one_epoch(
             epoch, model, train_loader, criterion, optimizer, scheduler,
-            compressor, logger, device, args, global_step
+            compressor, logger, device, args
         )
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
 
         if xm.is_master_ordinal():
             logger.epoch_end(epoch, train_loss, train_acc, val_loss, val_acc,
-                             compressor.last_stats, optimizer, model,
-                             train_compute_time=train_compute_time)
-            history.append({"epoch": epoch, "train_loss": train_loss, "train_acc": train_acc, "val_loss": val_loss, "val_acc": val_acc})
-            
+                             train_compute_time=compute_time)
+            history.append({"epoch": epoch, "train_loss": train_loss, "train_acc": train_acc,
+                            "val_loss": val_loss, "val_acc": val_acc})
             if val_acc > best_val_acc:
                 best_val_acc, best_epoch = val_acc, epoch
 
     if xm.is_master_ordinal():
         logger.print_final_summary(best_val_acc, best_epoch, history)
+
 
 if __name__ == "__main__":
     main()
