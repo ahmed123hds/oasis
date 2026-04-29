@@ -123,6 +123,7 @@ class OASISCompressor:
         adaptive_refresh: bool = False,
         criterion: str = "optimizer_aware",
         fixed_rank: Optional[int] = None,
+        rank_table: Optional[Dict[str, int]] = None,
         skip_classifier: bool = True,  # Skip compressing the final layer
     ):
         self.mode             = mode
@@ -140,6 +141,7 @@ class OASISCompressor:
         self.adaptive_refresh = adaptive_refresh
         self.criterion        = criterion
         self.fixed_rank       = fixed_rank
+        self.rank_table       = rank_table
         self.skip_classifier  = skip_classifier
 
         # Per-layer state
@@ -203,9 +205,9 @@ class OASISCompressor:
             H_2d = H_ef
 
         # ── Dispatch ──────────────────────────────────────────────────────────
-        if self.mode == "track":
+        if self.mode in ["track", "calibrated-track"]:
             compressed, best_rank, refreshed, drift_cos = \
-                self._compress_track(H_2d, H_ef, pid, m, n)
+                self._compress_track(H_2d, H_ef, pid, m, n, name)
             
             best_metric = _precond_cosine(H_ef, compressed, D) if compute_metrics else 1.0
         else:
@@ -246,7 +248,7 @@ class OASISCompressor:
 
     # ── OASIS-Track ───────────────────────────────────────────────────────────
 
-    def _compress_track(self, H_2d, G_2d, pid, m, n):
+    def _compress_track(self, H_2d, G_2d, pid, m, n, name):
         r_max = min(self.r_max, min(m, n))
 
         # Initialize V with orthonormal random matrix
@@ -259,9 +261,13 @@ class OASISCompressor:
         V_old = self._track_state[pid]
         self._refresh_counts[pid] = self._refresh_counts.get(pid, 0) + 1
 
+        layer_fixed_rank = self.fixed_rank
+        if self.rank_table is not None and name in self.rank_table:
+            layer_fixed_rank = self.rank_table[name]
+
         compressed, r, V_new = _track_compress(
             H_2d, G_2d, V_old, r_max, self.energy_tau, self.r_min,
-            fixed_rank=self.fixed_rank   # None → adaptive; int → fixed-rank ablation
+            fixed_rank=layer_fixed_rank   # None → adaptive; int → fixed-rank ablation
         )
         self._track_state[pid] = V_new
 

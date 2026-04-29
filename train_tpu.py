@@ -39,8 +39,8 @@ def parse_args():
     p.add_argument("--num-workers",     type=int,   default=4)
     
     # Ablation / mode flags
-    p.add_argument("--mode",              type=str,   default="exact",  choices=["exact", "track"],
-                   help="exact=randomized SVD, track=OASIS-Track (online warm-started)")
+    p.add_argument("--mode",              type=str,   default="exact",  choices=["exact", "track", "calibrated-track"],
+                   help="exact=randomized SVD, track=OASIS-Track (online), calibrated-track=frozen layer-wise ranks")
     p.add_argument("--r-max",             type=int,   default=72,       help="Max rank for OASIS-Track")
     p.add_argument("--energy-tau",        type=float, default=0.97,     help="Core energy threshold for OASIS-Track rank selection")
     p.add_argument("--min-numel",         type=int,   default=1024,     help="Skip compression for tensors smaller than this")
@@ -50,6 +50,7 @@ def parse_args():
     p.add_argument("--criterion",         type=str,   default="optimizer_aware",
                    choices=["optimizer_aware", "energy", "fixed"])
     p.add_argument("--fixed-rank",        type=int,   default=None)
+    p.add_argument("--rank-table",        type=str,   default=None,     help="JSON file mapping layer names to fixed ranks")
     p.add_argument("--dataset",           type=str,   default="cifar10", choices=["cifar10", "cifar100"])
     p.add_argument("--skip-classifier",   action="store_true")
     return p.parse_args()
@@ -177,6 +178,13 @@ def main():
     # Get the XLA device
     device = xm.xla_device()
 
+    # Load rank table if provided
+    rank_table = None
+    if args.rank_table:
+        import json
+        with open(args.rank_table, 'r') as f:
+            rank_table = json.load(f)
+
     train_loader, val_loader = build_loaders(args)
     num_classes = 100 if args.dataset == "cifar100" else 10
     model = ResNet18CIFAR(num_classes=num_classes).to(device)
@@ -194,7 +202,7 @@ def main():
         min_numel=args.min_numel,
         update_freq=args.update_freq, adaptive_refresh=args.adaptive_refresh,
         criterion=args.criterion, fixed_rank=args.fixed_rank,
-        skip_classifier=args.skip_classifier,
+        rank_table=rank_table, skip_classifier=args.skip_classifier,
     )
 
     logger = OASISLogger(args.epochs, len(train_loader), args.log_every)
