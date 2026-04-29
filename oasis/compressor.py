@@ -69,18 +69,31 @@ def _track_compress(H_2d, G_2d, V_old, r_max, energy_tau, r_min, fixed_rank=None
     # Level 3: rank selection — adaptive (energy threshold) or fixed
     if fixed_rank is not None:
         r = max(r_min, min(fixed_rank, r_max))
+        # Mask out columns/rows beyond r to maintain static graph shapes for XLA
+        mask = torch.zeros(r_max, device=S.device, dtype=S.dtype)
+        mask[:r] = 1.0
+        r_val = r
     else:
         s2  = S ** 2
         cum = torch.cumsum(s2, 0) / s2.sum().clamp(min=1e-10)
-        r   = int((cum < energy_tau).sum().item()) + 1
-        r   = max(r_min, min(r, r_max))
+        
+        mask = (cum < energy_tau).float()
+        # Shift mask right by 1 to include the first component > tau, and ensure at least 1 component
+        mask = torch.cat([torch.ones(1, device=mask.device, dtype=mask.dtype), mask[:-1]])
+        if r_min > 0:
+            mask[:r_min] = 1.0
+            
+        r_val = mask.sum() # r_val is a scalar tensor now, preventing CPU sync!
 
-    # Reconstruct in raw-gradient space via optimizer-aware basis
-    A   = U  @ P[:, :r]          # [m, r]
-    C   = Qt[:r, :] @ V.T        # [r, n]
+    # Apply mask instead of slicing to keep static shapes for XLA!
+    P_masked = P * mask.unsqueeze(0)
+    Qt_masked = Qt * mask.unsqueeze(1)
+
+    A   = U  @ P_masked          # [m, r_max]
+    C   = Qt_masked @ V.T        # [r_max, n]
     G_hat = A @ (A.T @ G_2d @ C.T) @ C
 
-    return G_hat, r, V.detach()
+    return G_hat, r_val, V.detach()
 
 
 # ── Compressor class ──────────────────────────────────────────────────────────
@@ -207,6 +220,9 @@ class OASISCompressor:
 
         if not compute_metrics:
             return param.grad, {}
+            
+        if isinstance(best_rank, torch.Tensor):
+            best_rank = int(best_rank.item())
 
         orig_numel       = G.numel()
         compressed_numel = best_rank * (m + 1 + n)
