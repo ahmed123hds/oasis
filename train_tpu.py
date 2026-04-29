@@ -190,7 +190,10 @@ def main():
     # Load precomputed bases if provided
     precomputed_bases = None
     if args.bases_file:
-        precomputed_bases = torch.load(args.bases_file, map_location=device)
+        precomputed_bases = torch.load(args.bases_file, map_location="cpu", weights_only=True)
+        # Manually move to XLA device
+        for k in precomputed_bases.keys():
+            precomputed_bases[k] = precomputed_bases[k].to(device)
 
     train_loader, val_loader = build_loaders(args)
     num_classes = 100 if args.dataset == "cifar100" else 10
