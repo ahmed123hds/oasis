@@ -97,8 +97,8 @@ def train_one_epoch(epoch, model, loader, criterion, optimizer, scheduler, compr
     train_compute_time = 0.0   # forward + backward + compress + optimizer (XLA sync'd)
     log_overhead_time  = 0.0   # printing / metric formatting only
 
-    # In XLA, using MpDeviceLoader is heavily recommended for performance
-    device_loader = pl.MpDeviceLoader(loader, device)
+    # For single-process TPU training, ParallelLoader is safer than MpDeviceLoader
+    device_loader = pl.ParallelLoader(loader, [device]).per_device_loader(device)
 
     for step, (images, labels) in enumerate(device_loader, start=1):
         # ── Pure compute: forward + backward + compress + optimizer ───────────
@@ -149,7 +149,7 @@ def train_one_epoch(epoch, model, loader, criterion, optimizer, scheduler, compr
 def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss = total_acc = n = 0
-    device_loader = pl.MpDeviceLoader(loader, device)
+    device_loader = pl.ParallelLoader(loader, [device]).per_device_loader(device)
     
     for images, labels in device_loader:
         logits = model(images)
