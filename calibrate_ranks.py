@@ -27,6 +27,8 @@ def main():
     p.add_argument("--r-max", type=int, default=72)
     p.add_argument("--steps", type=int, default=200, help="Number of calibration batches")
     p.add_argument("--out", type=str, default="ranks_cifar100.json")
+    p.add_argument("--data-dir", type=str, default="./data")
+    p.add_argument("--num-workers", type=int, default=4)
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
